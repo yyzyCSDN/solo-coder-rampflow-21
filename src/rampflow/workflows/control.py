@@ -85,8 +85,18 @@ class RampWorkflowControl:
         return self._guard(operation_id, "turnaround.dispatch.committed", subject, at, action, requirements=requirements)
 
     def publish_recovery_stand_plan(self, operation_id: str, subject: str, at: datetime, action: Callable[[], T], requirements: tuple[Decision, ...] = ()) -> OperationReceipt:
-        event = self.stream.publish(operation_id, utc(at), "recovery.stand.plan.published", subject, {"operation_id": operation_id})
+        previous = self._receipts.get(operation_id)
+        if previous is not None:
+            if previous.topic != "recovery.stand.plan.published" or previous.subject != subject:
+                raise ValueError("operation id reused for a different workflow")
+            return previous
+        rejected = tuple(item for item in requirements if not item.accepted)
+        if rejected:
+            raise WorkflowRejected(rejected)
+        # The domain plan must be accepted before any outward event exists;
+        # an unexecutable combination must never be advertised downstream.
         result = action()
+        event = self.stream.publish(operation_id, utc(at), "recovery.stand.plan.published", subject, {"operation_id": operation_id})
         receipt = OperationReceipt(operation_id, event.topic, subject, event, result)
         self._receipts[operation_id] = receipt
         return receipt

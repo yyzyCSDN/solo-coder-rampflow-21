@@ -109,31 +109,70 @@ class DisruptionOptimizer:
         )
         return tuple(sorted(out, key=lambda o: (o.score, o.action, o.departure or datetime.max.replace(tzinfo=flight.scheduled_off.tzinfo))))
 
-    def optimize(self, flights: Iterable[FlightRecoveryInput], candidate_stands: Mapping[str, tuple[str, ...]], stand_windows: Mapping[str, tuple[Window, ...]], generated_at: datetime) -> RecoveryPlan:
+    def optimize(
+        self,
+        flights: Iterable[FlightRecoveryInput],
+        candidate_stands: Mapping[str, tuple[str, ...]],
+        stand_windows: Mapping[str, tuple[Window, ...]],
+        generated_at: datetime,
+        incompatible_stands: Mapping[str, frozenset[str]] | None = None,
+    ) -> RecoveryPlan:
         flights = tuple(flights)
-        option_sets = [self.options_for(f, candidate_stands.get(f.flight_id, ()), stand_windows) for f in flights]
-        best = None
-        for combo in product(*[opts[:8] for opts in option_sets]):
-            conflict = False
+        if incompatible_stands is None:
+            incompatible_stands = {}
+        option_sets = [
+            self.options_for(f, candidate_stands.get(f.flight_id, ()), stand_windows)
+            for f in flights
+        ]
+
+        def incompatible(a: str, b: str) -> bool:
+            if a == b:
+                return True
+            pair = incompatible_stands.get(a, frozenset())
+            reverse = incompatible_stands.get(b, frozenset())
+            # Adjacency isolation is a physical, symmetric restriction even if
+            # the rule is declared on one side only.
+            return b in pair or a in reverse
+
+        def feasible(combo: tuple[RecoveryOption, ...]) -> bool:
+            # Safety limits are hard constraints: they may never be traded away
+            # for a cheaper score.  The occupancy table is shared across all
+            # flights in the combination, rather than rebuilt per option.
+            used: dict[str, list[datetime]] = {}
             for option in combo:
-                used: dict[str, list[datetime]] = {}
                 if option.action == "cancel":
                     continue
                 assert option.departure is not None and option.stand is not None
-                for existing in used.setdefault(option.stand, []):
-                    if abs((existing - option.departure).total_seconds()) < 15 * 60:
-                        conflict = True
-                        break
-                if conflict:
-                    break
-                used[option.stand].append(option.departure)
-            if conflict:
-                continue
-            score = sum(o.score for o in combo)
-            tie = tuple((o.flight_id, o.action, o.departure or generated_at, o.stand or "") for o in combo)
-            candidate = (score, tie, combo)
-            if best is None or candidate[:2] < best[:2]:
-                best = candidate
+                for occupied_stand, departures in used.items():
+                    if not incompatible(option.stand, occupied_stand):
+                        continue
+                    for existing in departures:
+                        if abs((existing - option.departure).total_seconds()) < 15 * 60:
+                            return False
+                used.setdefault(option.stand, []).append(option.departure)
+            return True
+
+        def search(truncate: bool):
+            sets = [opts[:8] for opts in option_sets] if truncate else option_sets
+            best = None
+            for combo in product(*sets):
+                if not feasible(combo):
+                    continue
+                score = sum(o.score for o in combo)
+                tie = tuple(
+                    (o.flight_id, o.action, o.departure or generated_at, o.stand or "")
+                    for o in combo
+                )
+                candidate = (score, tie, combo)
+                if best is None or candidate[:2] < best[:2]:
+                    best = candidate
+            return best
+
+        best = search(truncate=True)
+        if best is None:
+            # A feasible combination could live outside the per-flight top-N.
+            # Retry exhaustively before declaring the disruption unrecoverable.
+            best = search(truncate=False)
         if best is None:
             raise RuntimeError("no disruption recovery plan")
         combo = best[2]

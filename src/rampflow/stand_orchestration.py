@@ -83,8 +83,19 @@ class StandOrchestrator:
 
     def _adjacency_ok(self, stand_id: str, protected: Window, ignore: str | None = None) -> bool:
         profile = self.profiles[stand_id]
-        forbidden = set(profile.incompatible_simultaneous)
-        for other_id in forbidden:
+        # The incompatibility relation is physically symmetric even when only
+        # one side's profile declares it.  Check both directions: the incoming
+        # stand forbidding an occupied neighbour, and an occupied neighbour
+        # forbidding the incoming stand (a rule declared only on that side).
+        for other_id, other_profile in self.profiles.items():
+            if other_id == stand_id:
+                continue
+            forbids = (
+                other_id in profile.incompatible_simultaneous
+                or stand_id in other_profile.incompatible_simultaneous
+            )
+            if not forbids:
+                continue
             for assignment in self.by_stand.get(other_id, ()):
                 if assignment.flight_id == ignore:
                     continue
