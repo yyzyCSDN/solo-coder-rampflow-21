@@ -109,24 +109,54 @@ class DisruptionOptimizer:
         )
         return tuple(sorted(out, key=lambda o: (o.score, o.action, o.departure or datetime.max.replace(tzinfo=flight.scheduled_off.tzinfo))))
 
-    def optimize(self, flights: Iterable[FlightRecoveryInput], candidate_stands: Mapping[str, tuple[str, ...]], stand_windows: Mapping[str, tuple[Window, ...]], generated_at: datetime) -> RecoveryPlan:
+    @staticmethod
+    def _incompatible_pair(first: str, second: str, incompatible: Mapping[str, Iterable[str]]) -> bool:
+        return second in incompatible.get(first, ()) or first in incompatible.get(second, ())
+
+    @staticmethod
+    def _cap_options(options: tuple[RecoveryOption, ...], limit: int = 8) -> tuple[RecoveryOption, ...]:
+        if len(options) <= limit:
+            return options
+        keep = list(options[:limit])
+        if not any(o.action == "cancel" for o in keep):
+            cancel = next((o for o in options if o.action == "cancel"), None)
+            if cancel is not None:
+                keep.append(cancel)
+        return tuple(keep)
+
+    def optimize(
+        self,
+        flights: Iterable[FlightRecoveryInput],
+        candidate_stands: Mapping[str, tuple[str, ...]],
+        stand_windows: Mapping[str, tuple[Window, ...]],
+        generated_at: datetime,
+        incompatible_stands: Mapping[str, frozenset[str]] | None = None,
+        separation_minutes: int = 15,
+    ) -> RecoveryPlan:
         flights = tuple(flights)
-        option_sets = [self.options_for(f, candidate_stands.get(f.flight_id, ()), stand_windows) for f in flights]
+        option_sets = [
+            self._cap_options(self.options_for(f, candidate_stands.get(f.flight_id, ()), stand_windows))
+            for f in flights
+        ]
+        incompatible = incompatible_stands or {}
+        separation = timedelta(minutes=separation_minutes)
         best = None
-        for combo in product(*[opts[:8] for opts in option_sets]):
+        for combo in product(*option_sets):
+            placed: list[tuple[str, datetime]] = []
             conflict = False
             for option in combo:
-                used: dict[str, list[datetime]] = {}
                 if option.action == "cancel":
                     continue
                 assert option.departure is not None and option.stand is not None
-                for existing in used.setdefault(option.stand, []):
-                    if abs((existing - option.departure).total_seconds()) < 15 * 60:
+                for stand, departure in placed:
+                    if abs(departure - option.departure) >= separation:
+                        continue
+                    if stand == option.stand or self._incompatible_pair(stand, option.stand, incompatible):
                         conflict = True
                         break
                 if conflict:
                     break
-                used[option.stand].append(option.departure)
+                placed.append((option.stand, option.departure))
             if conflict:
                 continue
             score = sum(o.score for o in combo)
